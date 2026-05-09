@@ -38,9 +38,10 @@ class KVFS(pyfuse3.Operations):
     enable_writeback_cache = False
 
     def __init__(self, redis_url, entry_timeout=0.25, attr_timeout=0.25,
-                 waitaof=False, wait_timeout_ms=5000):
+                 waitaof=False, wait_timeout_ms=5000, prefix="kvfs"):
         super().__init__()
         self.redis = aioredis.from_url(redis_url)
+        self.prefix = prefix
         self.entry_timeout = entry_timeout
         self.attr_timeout = attr_timeout
         self.waitaof = waitaof
@@ -56,9 +57,9 @@ class KVFS(pyfuse3.Operations):
         self.lock_guard = asyncio.Lock()
         self.path_locks = {}
 
-    def _meta_key(self, path): return f"fs:meta:{norm(path)}"
-    def _data_key(self, path): return f"fs:data:{norm(path)}"
-    def _dir_key(self, path):  return f"fs:dir:{norm(path)}"
+    def _meta_key(self, path): return f"{self.prefix}:meta:{norm(path)}"
+    def _data_key(self, path): return f"{self.prefix}:data:{norm(path)}"
+    def _dir_key(self, path):  return f"{self.prefix}:dir:{norm(path)}"
 
     async def _ensure_root(self):
         if await self.redis.exists(self._meta_key("/")):
@@ -476,6 +477,7 @@ async def main_async(args):
         entry_timeout=args.entry_timeout,
         attr_timeout=args.attr_timeout,
         waitaof=args.waitaof,
+        prefix=args.prefix,
     )
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add("fsname=kvfs")
@@ -496,6 +498,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mountpoint")
     ap.add_argument("--redis-url", default="redis://127.0.0.1:6379/0")
+    ap.add_argument("--prefix", default="kvfs")
     ap.add_argument("--entry-timeout", type=float, default=0.25)
     ap.add_argument("--attr-timeout", type=float, default=0.25)
     ap.add_argument("--waitaof", action="store_true")
