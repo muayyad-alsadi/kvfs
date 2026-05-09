@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvfs-fuse"
+version = "0.1.0"
+description = "Redis/Valkey backed FUSE filesystem"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+authors = [
+  { name = "Muayyad Alsadi" }
+]
+
+dependencies = [
+  "pyfuse3",
+  "redis[hiredis]",
+  "trio"
+]
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: System :: Filesystems"
+]
+
+[project.scripts]
+kvfs = "kvfs:main"
+
+[tool.setuptools]
+py-modules = ["kvfs"]
+
+[project.urls]
+Homepage = "https://github.com/muayyad-alsadi/kvfs"
+Repository = "https://github.com/muayyad-alsadi/kvfs"
