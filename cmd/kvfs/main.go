@@ -22,6 +22,7 @@ func main() {
 	ns := flag.String("ns", "default", "kvfs namespace")
 	allowOther := flag.Bool("allow-other", false, "allow other users to access the mount")
 	debug := flag.Bool("debug", false, "enable FUSE debug logging")
+	opTimeout := flag.Duration("timeout", time.Second, "max Redis op duration")
 	flag.Parse()
 
 	if flag.NArg() != 1 {
@@ -34,26 +35,44 @@ func main() {
 	uid := uint32(os.Getuid())
 	gid := uint32(os.Getgid())
 
-	client, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress:  []string{*redisAddr},
-		DisableCache: true,
-	})
+	clientOpt := rueidis.ClientOption{
+		InitAddress:       []string{*redisAddr},
+		DisableCache:      true,
+		ForceSingleClient: true,
+		ConnWriteTimeout:  *opTimeout,
+	}
+
+	client, err := rueidis.NewClient(clientOpt)
 	if err != nil {
 		log.Fatalf("redis: %v", err)
 	}
 	defer client.Close()
 
-	ctx := context.Background()
+	// Separate connection for SUBSCRIBE so Dedicated MULTI never starves.
+	subClient, err := rueidis.NewClient(clientOpt)
+	if err != nil {
+		log.Fatalf("redis pubsub: %v", err)
+	}
+	defer subClient.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *opTimeout)
 	if err := client.Do(ctx, client.B().Ping().Build()).Error(); err != nil {
+		cancel()
 		log.Fatalf("redis ping: %v", err)
 	}
+	cancel()
 
 	st := store.New(client, *ns)
-	if err := st.BootstrapRoot(ctx, uid, gid); err != nil {
+	st.SetOpTimeout(*opTimeout)
+
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), *opTimeout)
+	if err := st.BootstrapRoot(bootCtx, uid, gid); err != nil {
+		bootCancel()
 		log.Fatalf("bootstrap: %v", err)
 	}
+	bootCancel()
 
-	root := kvfs.NewRoot(st, uid, gid)
+	root := kvfs.NewRoot(st, subClient, uid, gid)
 	defer root.Close()
 
 	timeout := time.Second
@@ -80,7 +99,7 @@ func main() {
 		log.Fatalf("mount: %v", err)
 	}
 
-	log.Printf("kvfs mounted on %s (ns=%s redis=%s)", mountpoint, *ns, *redisAddr)
+	log.Printf("kvfs mounted on %s (ns=%s redis=%s timeout=%s)", mountpoint, *ns, *redisAddr, *opTimeout)
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"kvfs/internal/store"
 
@@ -22,6 +23,7 @@ func newTestStore(t *testing.T) (*store.Store, *miniredis.Miniredis) {
 		InitAddress:       []string{mr.Addr()},
 		DisableCache:      true,
 		ForceSingleClient: true,
+		ConnWriteTimeout:  time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

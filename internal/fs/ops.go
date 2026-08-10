@@ -48,7 +48,6 @@ func doCreate(ctx context.Context, r *Root, parentIno *fs.Inode, parent store.Re
 	if err != nil {
 		return nil, nil, 0, errno(err)
 	}
-	r.notifyLocal(parent.ID, name)
 	child := &Node{root: r, ref: ref}
 	fillAttr(&out.Attr, m)
 	ino := parentIno.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFREG, Ino: m.ID})
@@ -62,7 +61,6 @@ func doMkdir(ctx context.Context, r *Root, parentIno *fs.Inode, parent store.Ref
 	if err != nil {
 		return nil, errno(err)
 	}
-	r.notifyLocal(parent.ID, name)
 	child := &Node{root: r, ref: ref}
 	fillAttr(&out.Attr, m)
 	ino := parentIno.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFDIR, Ino: m.ID})
@@ -75,7 +73,6 @@ func doSymlink(ctx context.Context, r *Root, parentIno *fs.Inode, parent store.R
 	if err != nil {
 		return nil, errno(err)
 	}
-	r.notifyLocal(parent.ID, name)
 	child := &Node{root: r, ref: ref}
 	fillAttr(&out.Attr, m)
 	ino := parentIno.NewInode(ctx, child, fs.StableAttr{Mode: fuse.S_IFLNK, Ino: m.ID})
@@ -87,7 +84,6 @@ func doUnlink(ctx context.Context, r *Root, parent store.Ref, name string) sysca
 	if err := r.store.Unlink(ctx, parent, name); err != nil {
 		return errno(err)
 	}
-	r.notifyLocal(parent.ID, name)
 	return 0
 }
 
@@ -95,7 +91,6 @@ func doRmdir(ctx context.Context, r *Root, parent store.Ref, name string) syscal
 	if err := r.store.Rmdir(ctx, parent, name); err != nil {
 		return errno(err)
 	}
-	r.notifyLocal(parent.ID, name)
 	return 0
 }
 
@@ -116,8 +111,6 @@ func doRename(ctx context.Context, r *Root, oldParent store.Ref, oldName string,
 			n.ref = store.Ref{ParentID: newParentRef.ID, Name: newName, ID: oldMeta.ID}
 		}
 	}
-	r.notifyLocal(oldParent.ID, oldName)
-	r.notifyLocal(newParentRef.ID, newName)
 	return 0
 }
 
@@ -173,7 +166,6 @@ func doSetattr(ctx context.Context, r *Root, ref store.Ref, in *fuse.SetAttrIn, 
 			return errno(err)
 		}
 	}
-	r.notifyLocal(ref.ParentID, ref.Name)
 	m, err := r.store.GetMetaRef(ctx, ref)
 	if err != nil {
 		return errno(err)

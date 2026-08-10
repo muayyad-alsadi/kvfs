@@ -43,11 +43,12 @@ Stored like files: `type=link` in metadata, target path in `data:`.
 
 ## Caching / invalidation
 
-- No userspace LRU; getattr/lookup hit Redis.
+- No userspace LRU; getattr/lookup hit Redis (1s op timeout by default).
 - Kernel `AttrTimeout` / `EntryTimeout` = 1s.
-- Rueidis client-side caching disabled.
-- On meta updates and file close: `PUBLISH kvfs:{ns} {parentId}:{basename}`; mounts subscribe and `NotifyEntry`.
-
+- Rueidis client-side caching disabled; `ForceSingleClient` for standalone Redis/Valkey.
+- Separate Redis client for `SUBSCRIBE` so MULTI/EXEC never starves.
+- On meta updates: `PUBLISH kvfs:{ns} {parentId}:{basename}`; mounts enqueue `NotifyEntry` on a background goroutine (never from the FUSE request path — that deadlocks).
+- Bootstrap uses `SET NX` so concurrent mounts create root once.
 ## Multi-host
 
 Mount the same `-ns` on each server against the same Redis/Valkey.

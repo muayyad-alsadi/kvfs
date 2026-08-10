@@ -15,25 +15,35 @@ import (
 	"github.com/redis/rueidis"
 )
 
+type invalidateReq struct {
+	parentID uint64
+	name     string
+}
+
 // Root is the FUSE filesystem root and owns Redis + inode registry state.
 type Root struct {
 	fs.Inode
 
-	store  *store.Store
-	uid    uint32
-	gid    uint32
-	cancel context.CancelFunc
+	store     *store.Store
+	subClient rueidis.Client // dedicated client for SUBSCRIBE only
+	uid       uint32
+	gid       uint32
+	cancel    context.CancelFunc
 
 	mu   sync.RWMutex
-	byID map[uint64]*fs.Inode // immutable id -> kernel inode for NotifyEntry
+	byID map[uint64]*fs.Inode
+
+	invCh chan invalidateReq
 }
 
-func NewRoot(st *store.Store, uid, gid uint32) *Root {
+func NewRoot(st *store.Store, subClient rueidis.Client, uid, gid uint32) *Root {
 	return &Root{
-		store: st,
-		uid:   uid,
-		gid:   gid,
-		byID:  make(map[uint64]*fs.Inode),
+		store:     st,
+		subClient: subClient,
+		uid:       uid,
+		gid:       gid,
+		byID:      make(map[uint64]*fs.Inode),
+		invCh:     make(chan invalidateReq, 256),
 	}
 }
 
@@ -47,6 +57,7 @@ func (r *Root) OnAdd(ctx context.Context) {
 	r.track(store.RootID, r.EmbeddedInode())
 	subCtx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+	go r.invalidateLoop(subCtx)
 	go r.subscribeLoop(subCtx)
 }
 
@@ -68,8 +79,37 @@ func (r *Root) inodeByID(id uint64) *fs.Inode {
 	return r.byID[id]
 }
 
+// enqueueInvalidate schedules a kernel dentry invalidate. Never call
+// NotifyEntry from a FUSE request handler — that deadlocks with the kernel.
+func (r *Root) enqueueInvalidate(parentID uint64, name string) {
+	select {
+	case r.invCh <- invalidateReq{parentID: parentID, name: name}:
+	default:
+		// Drop under pressure; attr/entry timeouts will refresh.
+	}
+}
+
+func (r *Root) invalidateLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req := <-r.invCh:
+			parent := r.inodeByID(req.parentID)
+			if parent == nil {
+				continue
+			}
+			// NotifyEntry must not run on the FUSE request path.
+			parent.NotifyEntry(req.name)
+		}
+	}
+}
+
 func (r *Root) subscribeLoop(ctx context.Context) {
-	client := r.store.Client()
+	client := r.subClient
+	if client == nil {
+		client = r.store.Client()
+	}
 	ch := r.store.Channel()
 	for {
 		if ctx.Err() != nil {
@@ -80,7 +120,7 @@ func (r *Root) subscribeLoop(ctx context.Context) {
 			if err != nil {
 				return
 			}
-			r.invalidate(parentID, name)
+			r.enqueueInvalidate(parentID, name)
 		})
 		if ctx.Err() != nil {
 			return
@@ -94,18 +134,6 @@ func (r *Root) subscribeLoop(ctx context.Context) {
 			}
 		}
 	}
-}
-
-func (r *Root) invalidate(parentID uint64, name string) {
-	parent := r.inodeByID(parentID)
-	if parent == nil {
-		return
-	}
-	parent.NotifyEntry(name)
-}
-
-func (r *Root) notifyLocal(parentID uint64, name string) {
-	r.invalidate(parentID, name)
 }
 
 func errno(err error) syscall.Errno {
@@ -122,6 +150,10 @@ func errno(err error) syscall.Errno {
 		return syscall.ENOTDIR
 	case errors.Is(err, store.ErrIsDir):
 		return syscall.EISDIR
+	case errors.Is(err, store.ErrTimeout):
+		return syscall.ETIMEDOUT
+	case errors.Is(err, context.DeadlineExceeded):
+		return syscall.ETIMEDOUT
 	default:
 		log.Printf("kvfs: %v", err)
 		return syscall.EIO
@@ -157,17 +189,17 @@ func stableMode(m *store.Meta) uint32 {
 func (r *Root) ref() store.Ref { return store.RootRef() }
 
 var (
-	_ fs.NodeOnAdder    = (*Root)(nil)
-	_ fs.NodeGetattrer  = (*Root)(nil)
-	_ fs.NodeLookuper   = (*Root)(nil)
-	_ fs.NodeReaddirer  = (*Root)(nil)
-	_ fs.NodeCreater    = (*Root)(nil)
-	_ fs.NodeMkdirer    = (*Root)(nil)
-	_ fs.NodeUnlinker   = (*Root)(nil)
-	_ fs.NodeRmdirer    = (*Root)(nil)
-	_ fs.NodeRenamer    = (*Root)(nil)
-	_ fs.NodeSymlinker  = (*Root)(nil)
-	_ fs.NodeSetattrer  = (*Root)(nil)
+	_ fs.NodeOnAdder   = (*Root)(nil)
+	_ fs.NodeGetattrer = (*Root)(nil)
+	_ fs.NodeLookuper  = (*Root)(nil)
+	_ fs.NodeReaddirer = (*Root)(nil)
+	_ fs.NodeCreater   = (*Root)(nil)
+	_ fs.NodeMkdirer   = (*Root)(nil)
+	_ fs.NodeUnlinker  = (*Root)(nil)
+	_ fs.NodeRmdirer   = (*Root)(nil)
+	_ fs.NodeRenamer   = (*Root)(nil)
+	_ fs.NodeSymlinker = (*Root)(nil)
+	_ fs.NodeSetattrer = (*Root)(nil)
 )
 
 func (r *Root) Getattr(ctx context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {

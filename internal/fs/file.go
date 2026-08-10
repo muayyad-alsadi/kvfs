@@ -20,13 +20,13 @@ type fileHandle struct {
 }
 
 var (
-	_ fs.FileReader      = (*fileHandle)(nil)
-	_ fs.FileWriter      = (*fileHandle)(nil)
-	_ fs.FileFlusher     = (*fileHandle)(nil)
-	_ fs.FileFsyncer     = (*fileHandle)(nil)
-	_ fs.FileReleaser    = (*fileHandle)(nil)
-	_ fs.FileGetattrer   = (*fileHandle)(nil)
-	_ fs.FileSetattrer   = (*fileHandle)(nil)
+	_ fs.FileReader    = (*fileHandle)(nil)
+	_ fs.FileWriter    = (*fileHandle)(nil)
+	_ fs.FileFlusher   = (*fileHandle)(nil)
+	_ fs.FileFsyncer   = (*fileHandle)(nil)
+	_ fs.FileReleaser  = (*fileHandle)(nil)
+	_ fs.FileGetattrer = (*fileHandle)(nil)
+	_ fs.FileSetattrer = (*fileHandle)(nil)
 )
 
 func (fh *fileHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -58,20 +58,26 @@ func (fh *fileHandle) Write(_ context.Context, data []byte, off int64) (uint32, 
 
 func (fh *fileHandle) flush(ctx context.Context, publishAlways bool) syscall.Errno {
 	fh.mu.Lock()
-	defer fh.mu.Unlock()
-	if fh.dirty {
-		if _, err := fh.root.store.WriteData(ctx, fh.ref.ParentID, fh.ref.Name, fh.data, true); err != nil {
+	dirty := fh.dirty
+	var data []byte
+	if dirty {
+		data = append([]byte(nil), fh.data...)
+	}
+	fh.mu.Unlock()
+
+	if dirty {
+		if _, err := fh.root.store.WriteData(ctx, fh.ref.ParentID, fh.ref.Name, data, true); err != nil {
 			return errno(err)
 		}
+		fh.mu.Lock()
 		fh.dirty = false
-		fh.root.notifyLocal(fh.ref.ParentID, fh.ref.Name)
+		fh.mu.Unlock()
 		return 0
 	}
 	if publishAlways {
-		if err := fh.root.store.Publish(ctx, fh.ref.ParentID, fh.ref.Name); err != nil {
-			return errno(err)
-		}
-		fh.root.notifyLocal(fh.ref.ParentID, fh.ref.Name)
+		// Only notify remotes that content may have been read/closed; do not
+		// call NotifyEntry on this request path.
+		_ = fh.root.store.Publish(ctx, fh.ref.ParentID, fh.ref.Name)
 	}
 	return 0
 }
@@ -85,7 +91,8 @@ func (fh *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 }
 
 func (fh *fileHandle) Release(ctx context.Context) syscall.Errno {
-	return fh.flush(ctx, true)
+	// Publish only if we wrote; avoid pub/sub storms on read-only close.
+	return fh.flush(ctx, false)
 }
 
 func (fh *fileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
