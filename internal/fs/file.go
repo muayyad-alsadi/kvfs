@@ -11,12 +11,18 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
+// fileHandle holds no content. Every read and write goes to the content key, so
+// two handles of one file, on one mount or on two, see the same bytes. Read-only
+// handles let the kernel cache those bytes (FOPEN_KEEP_CACHE, see openFlags); the
+// invalidate loop drops them when a write on another mount is published. A write
+// is one SETRANGE; the modification time is stamped once, when the handle
+// flushes or closes.
 type fileHandle struct {
-	root  *Root
-	ref   store.Ref
+	root *Root
+	ref  store.Ref
+
 	mu    sync.Mutex
-	data  []byte
-	dirty bool
+	wrote bool
 }
 
 var (
@@ -29,98 +35,55 @@ var (
 	_ fs.FileSetattrer = (*fileHandle)(nil)
 )
 
-func (fh *fileHandle) Read(_ context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-	if off >= int64(len(fh.data)) {
-		return fuse.ReadResultData(nil), 0
+func (fh *fileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	data, err := fh.root.store.ReadAt(ctx, fh.ref.ParentID, fh.ref.Name, off, len(dest))
+	if err != nil {
+		return nil, errno(err)
 	}
-	end := int(off) + len(dest)
-	if end > len(fh.data) {
-		end = len(fh.data)
-	}
-	return fuse.ReadResultData(fh.data[off:end]), 0
+	return fuse.ReadResultData(data), 0
 }
 
-func (fh *fileHandle) Write(_ context.Context, data []byte, off int64) (uint32, syscall.Errno) {
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-	end := int(off) + len(data)
-	if end > len(fh.data) {
-		nd := make([]byte, end)
-		copy(nd, fh.data)
-		fh.data = nd
+func (fh *fileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	if err := fh.root.store.WriteAt(ctx, fh.ref.ParentID, fh.ref.Name, off, data); err != nil {
+		return 0, errno(err)
 	}
-	copy(fh.data[off:], data)
-	fh.dirty = true
+	fh.mu.Lock()
+	fh.wrote = true
+	fh.mu.Unlock()
 	return uint32(len(data)), 0
 }
 
-func (fh *fileHandle) flush(ctx context.Context, publishAlways bool) syscall.Errno {
+// flush stamps the file modified if this handle wrote to it.
+func (fh *fileHandle) flush(ctx context.Context) syscall.Errno {
 	fh.mu.Lock()
-	dirty := fh.dirty
-	var data []byte
-	if dirty {
-		data = append([]byte(nil), fh.data...)
-	}
+	wrote := fh.wrote
+	fh.wrote = false
 	fh.mu.Unlock()
-
-	if dirty {
-		if _, err := fh.root.store.WriteData(ctx, fh.ref.ParentID, fh.ref.Name, data, true); err != nil {
-			return errno(err)
-		}
-		fh.mu.Lock()
-		fh.dirty = false
-		fh.mu.Unlock()
+	if !wrote {
 		return 0
 	}
-	if publishAlways {
-		// Only notify remotes that content may have been read/closed; do not
-		// call NotifyEntry on this request path.
-		_ = fh.root.store.Publish(ctx, fh.ref.ParentID, fh.ref.Name)
+	if err := fh.root.store.MarkModified(ctx, fh.ref.ParentID, fh.ref.Name); err != nil {
+		return errno(err)
 	}
 	return 0
 }
 
-func (fh *fileHandle) Flush(ctx context.Context) syscall.Errno {
-	return fh.flush(ctx, false)
-}
+func (fh *fileHandle) Flush(ctx context.Context) syscall.Errno { return fh.flush(ctx) }
 
-func (fh *fileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	return fh.flush(ctx, false)
-}
+// Fsync has nothing to push: every write already reached the server.
+func (fh *fileHandle) Fsync(context.Context, uint32) syscall.Errno { return 0 }
 
-func (fh *fileHandle) Release(ctx context.Context) syscall.Errno {
-	// Publish only if we wrote; avoid pub/sub storms on read-only close.
-	return fh.flush(ctx, false)
-}
+func (fh *fileHandle) Release(ctx context.Context) syscall.Errno { return fh.flush(ctx) }
 
 func (fh *fileHandle) Getattr(ctx context.Context, out *fuse.AttrOut) syscall.Errno {
-	m, err := fh.root.store.GetMetaRef(ctx, fh.ref)
+	m, err := fh.root.store.StatRef(ctx, fh.ref)
 	if err != nil {
 		return errno(err)
 	}
-	fh.mu.Lock()
-	if fh.dirty {
-		m.Size = uint64(len(fh.data))
-	}
-	fh.mu.Unlock()
 	fillAttr(&out.Attr, m)
 	return 0
 }
 
 func (fh *fileHandle) Setattr(ctx context.Context, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
-	if size, ok := in.GetSize(); ok {
-		fh.mu.Lock()
-		if uint64(len(fh.data)) > size {
-			fh.data = fh.data[:size]
-		} else if uint64(len(fh.data)) < size {
-			nd := make([]byte, size)
-			copy(nd, fh.data)
-			fh.data = nd
-		}
-		fh.dirty = true
-		fh.mu.Unlock()
-	}
 	return doSetattr(ctx, fh.root, fh.ref, in, out)
 }

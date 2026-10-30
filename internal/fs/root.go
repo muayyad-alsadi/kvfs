@@ -33,7 +33,11 @@ type Root struct {
 	mu   sync.RWMutex
 	byID map[uint64]*fs.Inode
 
-	invCh chan invalidateReq
+	invCh    chan invalidateReq
+	repairCh chan repairReq
+	health   healthCounters
+	grace    time.Duration // how long a pending field must stay unchanged before repair
+	wg       sync.WaitGroup
 }
 
 func NewRoot(st *store.Store, subClient rueidis.Client, uid, gid uint32) *Root {
@@ -44,21 +48,35 @@ func NewRoot(st *store.Store, subClient rueidis.Client, uid, gid uint32) *Root {
 		gid:       gid,
 		byID:      make(map[uint64]*fs.Inode),
 		invCh:     make(chan invalidateReq, 256),
+		repairCh:  make(chan repairReq, 256),
+		grace:     graceFactor * st.OpTimeout(),
 	}
 }
 
+// Close stops the background loops and waits for them to return.
 func (r *Root) Close() {
 	if r.cancel != nil {
 		r.cancel()
 	}
+	r.wg.Wait()
 }
 
 func (r *Root) OnAdd(ctx context.Context) {
 	r.track(store.RootID, r.EmbeddedInode())
 	subCtx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	go r.invalidateLoop(subCtx)
-	go r.subscribeLoop(subCtx)
+	r.goLoop(func() { r.invalidateLoop(subCtx) })
+	r.goLoop(func() { r.subscribeLoop(subCtx) })
+	r.goLoop(func() { r.repairLoop(subCtx) })
+}
+
+// goLoop runs one background loop; Close waits for it.
+func (r *Root) goLoop(fn func()) {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		fn()
+	}()
 }
 
 func (r *Root) track(id uint64, ino *fs.Inode) {
@@ -79,13 +97,14 @@ func (r *Root) inodeByID(id uint64) *fs.Inode {
 	return r.byID[id]
 }
 
-// enqueueInvalidate schedules a kernel dentry invalidate. Never call
-// NotifyEntry from a FUSE request handler — that deadlocks with the kernel.
-func (r *Root) enqueueInvalidate(parentID uint64, name string) {
+// enqueueInvalidate hands one published address to the invalidate loop. It
+// waits when the loop is busy rather than dropping: with the kernel cache on,
+// a dropped message would leave the cached bytes stale. Only the subscriber
+// calls it, never a FUSE request, so the wait cannot deadlock with the kernel.
+func (r *Root) enqueueInvalidate(ctx context.Context, parentID uint64, name string) {
 	select {
 	case r.invCh <- invalidateReq{parentID: parentID, name: name}:
-	default:
-		// Drop under pressure; attr/entry timeouts will refresh.
+	case <-ctx.Done():
 	}
 }
 
@@ -95,13 +114,21 @@ func (r *Root) invalidateLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case req := <-r.invCh:
-			parent := r.inodeByID(req.parentID)
-			if parent == nil {
-				continue
-			}
-			// NotifyEntry must not run on the FUSE request path.
-			parent.NotifyEntry(req.name)
+			r.invalidate(req)
 		}
+	}
+}
+
+// invalidate drops the kernel's dentry for the name and the cached attributes
+// and bytes of the child. It runs on the invalidate loop, never on a request.
+func (r *Root) invalidate(req invalidateReq) {
+	parent := r.inodeByID(req.parentID)
+	if parent == nil {
+		return // the kernel cannot hold anything under an unknown parent
+	}
+	parent.NotifyEntry(req.name)
+	if child := parent.GetChild(req.name); child != nil {
+		child.NotifyContent(0, 0) // length 0: attributes and every cached page
 	}
 }
 
@@ -120,7 +147,7 @@ func (r *Root) subscribeLoop(ctx context.Context) {
 			if err != nil {
 				return
 			}
-			r.enqueueInvalidate(parentID, name)
+			r.enqueueInvalidate(ctx, parentID, name)
 		})
 		if ctx.Err() != nil {
 			return
@@ -150,6 +177,8 @@ func errno(err error) syscall.Errno {
 		return syscall.ENOTDIR
 	case errors.Is(err, store.ErrIsDir):
 		return syscall.EISDIR
+	case errors.Is(err, store.ErrBusy):
+		return syscall.EBUSY
 	case errors.Is(err, store.ErrTimeout):
 		return syscall.ETIMEDOUT
 	case errors.Is(err, context.DeadlineExceeded):
@@ -176,14 +205,7 @@ func fillAttr(out *fuse.Attr, m *store.Meta) {
 }
 
 func stableMode(m *store.Meta) uint32 {
-	switch m.Type {
-	case store.TypeDir:
-		return fuse.S_IFDIR
-	case store.TypeLink:
-		return fuse.S_IFLNK
-	default:
-		return fuse.S_IFREG
-	}
+	return store.FuseModeType(m.Type)
 }
 
 func (r *Root) ref() store.Ref { return store.RootRef() }
@@ -203,7 +225,7 @@ var (
 )
 
 func (r *Root) Getattr(ctx context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	m, err := r.store.GetMetaRef(ctx, r.ref())
+	m, err := r.store.StatRef(ctx, r.ref())
 	if err != nil {
 		return errno(err)
 	}
@@ -236,7 +258,7 @@ func (r *Root) Rmdir(ctx context.Context, name string) syscall.Errno {
 }
 
 func (r *Root) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	return doRename(ctx, r, r.ref(), name, newParent, newName)
+	return doRename(ctx, r, r.ref(), name, newParent, newName, flags)
 }
 
 func (r *Root) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {

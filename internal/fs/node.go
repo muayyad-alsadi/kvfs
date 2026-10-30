@@ -38,7 +38,7 @@ func (n *Node) OnForget() {
 }
 
 func (n *Node) Getattr(ctx context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	m, err := n.root.store.GetMetaRef(ctx, n.ref)
+	m, err := n.root.store.StatRef(ctx, n.ref)
 	if err != nil {
 		return errno(err)
 	}
@@ -71,7 +71,7 @@ func (n *Node) Rmdir(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *Node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	return doRename(ctx, n.root, n.ref, name, newParent, newName)
+	return doRename(ctx, n.root, n.ref, name, newParent, newName, flags)
 }
 
 func (n *Node) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
@@ -104,20 +104,22 @@ func (n *Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if m.Type == store.TypeLink {
 		return nil, 0, syscall.ELOOP
 	}
-	data, err := n.root.store.GetData(ctx, n.ref.ParentID, n.ref.Name)
-	if err != nil {
-		return nil, 0, errno(err)
-	}
-	fh := &fileHandle{
-		root: n.root,
-		ref:  n.ref,
-		data: append([]byte(nil), data...),
-	}
 	if flags&syscall.O_TRUNC != 0 {
-		fh.data = nil
-		fh.dirty = true
+		if _, err := n.root.store.Truncate(ctx, n.ref.ParentID, n.ref.Name, 0); err != nil {
+			return nil, 0, errno(err)
+		}
 	}
-	return fh, fuse.FOPEN_DIRECT_IO, 0
+	return &fileHandle{root: n.root, ref: n.ref}, openFlags(flags), 0
+}
+
+// openFlags keeps the kernel page cache for read-only opens and bypasses it for
+// writable ones. A cached write is split into more requests than the caller made
+// (about 1.5 per 10 KiB write), and each request is one Redis script call.
+func openFlags(flags uint32) uint32 {
+	if flags&syscall.O_ACCMODE == syscall.O_RDONLY {
+		return fuse.FOPEN_KEEP_CACHE
+	}
+	return fuse.FOPEN_DIRECT_IO
 }
 
 func (n *Node) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
