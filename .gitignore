@@ -1,3 +1,4 @@
 /kvfs
 /*.test
 /tmp/
+/dist/

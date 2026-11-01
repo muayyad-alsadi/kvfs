@@ -10,6 +10,8 @@ Redis/Valkey-backed FUSE3 filesystem for small shared files (`.env`, config) acr
 go build -o kvfs ./cmd/kvfs
 ```
 
+`just build` produces the same binary with the release flags. `just test` runs the unit tests. `just check` also runs gofmt and `go vet`.
+
 ## Mount
 
 ```bash
